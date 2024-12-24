@@ -3,8 +3,11 @@ import { Keyring } from "@polkadot/api";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { startLiquidator } from "./liquidate";
 export { startLiquidator };
+import * as dotenv from 'dotenv';
+
 
 async function main() {
+    dotenv.config();
     if (!process.env.LENDING_LIQUIDATOR_ACCOUNT || !process.env.PARACHAIN_URL) {
         Promise.reject(
             "`PARACHAIN_URL` and `LENDING_LIQUIDATOR_ACCOUNT` environment variables not set"

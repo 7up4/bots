@@ -2,6 +2,8 @@ import { ChainBalance, CollateralPosition, CurrencyExt, InterBtcApi, LoansMarket
 import { Currency, ExchangeRate, MonetaryAmount } from "@interlay/monetary-js";
 import { AccountId } from "@polkadot/types/interfaces";
 import { AddressOrPair } from "@polkadot/api/types";
+import fetch from 'node-fetch';
+import { URLSearchParams } from 'url';
 
 type CollateralAndValue = {
     collateral: MonetaryAmount<Currency>,
@@ -61,13 +63,65 @@ function liquidationStrategy(
     liquidatorBalance: Map<String, ChainBalance>,
     oracleRates: Map<String, ExchangeRate<Currency, CurrencyExt>>,
     undercollateralizedBorrowers: UndercollateralizedPosition[],
-    markets: Map<String, LoansMarket>
+    markets: Map<String, LoansMarket>,
+    dryRun: String = "false",
 ): [MonetaryAmount<CurrencyExt>, CurrencyExt, AccountId] | undefined {
         const referenceCurrency = interBtcApi.getWrappedCurrency();
         let maxRepayableLoan = newMonetaryAmount(0, referenceCurrency);
         let result: [MonetaryAmount<CurrencyExt>, CurrencyExt, AccountId] | undefined;
+
+        if (dryRun == "true") {
+            dryRunAndNotifyAboutLiquidations(oracleRates, undercollateralizedBorrowers, markets, referenceCurrency, maxRepayableLoan);
+        } else {
+            undercollateralizedBorrowers.forEach((position) => {
+                // Among the collateral currencies locked by this borrower, which one is worth the most?
+                const highestValueCollateral = findHighestValueCollateral(
+                    position.collateralPositions,
+                    oracleRates,
+                    referenceCurrency
+                ); 
+                if (!highestValueCollateral) {
+                    return;
+                }
+                // Among the borrowed currencies of this borrower, which one accepts the biggest repayment?
+                // (i.e. is worth the most after considering the close factor)
+                position.borrowPositions.forEach((loan) => {
+                    const totalDebt = loan.amount.add(loan.accumulatedDebt);
+                    // If this loan can be repaid using the lending-liquidator's balance
+                    if (liquidatorBalance.has(totalDebt.currency.ticker)) {
+                        const loansMarket = markets.get(totalDebt.currency.ticker) as LoansMarket;
+                        const closeFactor = decodePermill(loansMarket.closeFactor);
+                        // `liquidationIncentive` includes the liquidation premium
+                        // e.g. if the premium is 10%, `liquidationIncentive` is 110%  
+                        const liquidationIncentive = decodeFixedPointType(loansMarket.liquidateIncentive)
+                        const balance = liquidatorBalance.get(totalDebt.currency.ticker) as ChainBalance;
+                        const rate = oracleRates.get(totalDebt.currency.ticker) as ExchangeRate<Currency, CurrencyExt>;
+                        // Can only repay a fraction of the total debt, defined by the `closeFactor`
+                        const repayableAmount = totalDebt.mul(closeFactor).min(balance.free);
+                        const referenceRepayable = referenceValue(repayableAmount, rate, referenceCurrency);
+                        if (
+                            // The liquidation must be profitable
+                            highestValueCollateral.referenceValue.gte(referenceRepayable.mul(liquidationIncentive)) && 
+                            referenceRepayable.gt(maxRepayableLoan)
+                        ) {
+                            maxRepayableLoan = referenceRepayable;
+                            result = [repayableAmount, highestValueCollateral.collateral.currency, position.accountId];
+                        }
+                    }
+                })
+            });
+        }        
+        return result;
+    }
+
+    async function dryRunAndNotifyAboutLiquidations(
+        oracleRates: Map<String, ExchangeRate<Currency, CurrencyExt>>,
+        undercollateralizedBorrowers: UndercollateralizedPosition[],
+        markets: Map<String, LoansMarket>,
+        referenceCurrency: Currency,
+        maxRepayableLoan: MonetaryAmount<Currency>,
+    ): Promise<void> {
         undercollateralizedBorrowers.forEach((position) => {
-            // Among the collateral currencies locked by this borrower, which one is worth the most?
             const highestValueCollateral = findHighestValueCollateral(
                 position.collateralPositions,
                 oracleRates,
@@ -76,35 +130,34 @@ function liquidationStrategy(
             if (!highestValueCollateral) {
                 return;
             }
-            // Among the borrowed currencies of this borrower, which one accepts the biggest repayment?
-            // (i.e. is worth the most after considering the close factor)
-            position.borrowPositions.forEach((loan) => {
+            position.borrowPositions.forEach(async (loan) => {
                 const totalDebt = loan.amount.add(loan.accumulatedDebt);
-                // If this loan can be repaid using the lending-liquidator's balance
-                if (liquidatorBalance.has(totalDebt.currency.ticker)) {
-                    const loansMarket = markets.get(totalDebt.currency.ticker) as LoansMarket;
-                    const closeFactor = decodePermill(loansMarket.closeFactor);
-                    // `liquidationIncentive` includes the liquidation premium
-                    // e.g. if the premium is 10%, `liquidationIncentive` is 110%  
-                    const liquidationIncentive = decodeFixedPointType(loansMarket.liquidateIncentive)
-                    const balance = liquidatorBalance.get(totalDebt.currency.ticker) as ChainBalance;
-                    const rate = oracleRates.get(totalDebt.currency.ticker) as ExchangeRate<Currency, CurrencyExt>;
-                    // Can only repay a fraction of the total debt, defined by the `closeFactor`
-                    const repayableAmount = totalDebt.mul(closeFactor).min(balance.free);
-                    const referenceRepayable = referenceValue(repayableAmount, rate, referenceCurrency);
-                    if (
-                        // The liquidation must be profitable
-                        highestValueCollateral.referenceValue.gte(referenceRepayable.mul(liquidationIncentive)) && 
-                        referenceRepayable.gt(maxRepayableLoan)
-                    ) {
-                        maxRepayableLoan = referenceRepayable;
-                        result = [repayableAmount, highestValueCollateral.collateral.currency, position.accountId];
-                    }
+                const loansMarket = markets.get(totalDebt.currency.ticker) as LoansMarket;
+                const closeFactor = decodePermill(loansMarket.closeFactor);
+                const liquidationIncentive = decodeFixedPointType(loansMarket.liquidateIncentive)
+                const rate = oracleRates.get(totalDebt.currency.ticker) as ExchangeRate<Currency, CurrencyExt>;
+                const repayableAmount = totalDebt.mul(closeFactor);
+                const referenceRepayable = referenceValue(repayableAmount, rate, referenceCurrency);
+                if (
+                    highestValueCollateral.referenceValue.gte(referenceRepayable.mul(liquidationIncentive)) && 
+                    referenceRepayable.gt(maxRepayableLoan) && 
+                    (
+                        (["USDT", "USDC"].includes(repayableAmount.currency.ticker)) && Number(repayableAmount.toHuman()) >= 30.0 ||
+                        ((repayableAmount.currency.ticker == "DOT") && Number(repayableAmount.toHuman()) >= 100.0)
+                    )
+                ) {
+                    const params = new URLSearchParams();
+                    params.append('title', "Alert! Opportunity for a liquidation!");
+                    params.append(
+                        'message',
+                        `Go and check Interlay: Liquidating ${position.accountId.toString()} with ${repayableAmount.toHuman()} ${repayableAmount.currency.ticker}, collateral: ${highestValueCollateral.collateral.currency.ticker}!`
+                    );
+                    const response = await fetch(`${process.env.GOTIFY_URL}`, {method: 'POST', body: params});
+                    const data = await response.json();
                 }
             })
         });
-        return result;
-    }
+    };
     
     async function checkForLiquidations(interBtcApi: InterBtcApi): Promise<void> {
         const accountId = addressOrPairAsAccountId(interBtcApi.api, interBtcApi.account as AddressOrPair);
@@ -134,7 +187,8 @@ function liquidationStrategy(
             liquidatorBalance,
             oracleRates,
             undercollateralizedBorrowers,
-            new Map(marketsArray.map(([currency, market]) => [currency.ticker, market]))
+            new Map(marketsArray.map(([currency, market]) => [currency.ticker, market])),
+            `${process.env.DRY_RUN}`
         ) as [MonetaryAmount<CurrencyExt>, CurrencyExt, AccountId];
         if (potentialLiquidation) {
             const [amountToRepay, collateralToLiquidate, borrower] = potentialLiquidation;
